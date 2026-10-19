@@ -5,60 +5,84 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-14
-    timeout-minutes: 120
+    name: Build Unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 150
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: 切换 Xcode 命令行工具路径
-        run: sudo xcode-select --switch /Applications/Xcode.app
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: 打印 Xcode 版本
-        run: xcodebuild -version && swift --version
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 安装 Rust 工具链
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "26"
+
+      - uses: jdx/mise-action@v4
+
+      - name: Install Prereqs
+        run: brew install swift-protobuf
+
+      - name: 确认工具链版本
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          source "$HOME/.cargo/env"
-          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          xcodebuild -version
+          rustc --version
+          cargo --version
+          tuist version
+          protoc --version
 
-      - name: 安装 brew 依赖
-        run: brew install swift-protobuf tuist xcbeautify
+      - name: Build Logic (iOS device)
+        run: make logic ALL_TARGETS="aarch64-apple-ios" MODE=debug
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: sccache
 
-      - name: 安装 xcraft
-        run: cargo install xcraft
+      - name: Generate Xcode Project
+        working-directory: app
+        run: tuist generate --no-open
 
-      - name: 编译 Rust logic 层 + 合成 xcframework
-        run: make ios
-
-      - name: 生成工程并构建
-        run: make build
-
-      - name: Archive（关闭签名）
+      - name: 定位工程与 scheme
+        working-directory: app
         run: |
-          WORKSPACE=$(ls -d app/*.xcworkspace 2>/dev/null | head -1 || true)
-          PROJECT=$(ls -d app/*.xcodeproj 2>/dev/null | head -1 || true)
-          if [ -n "$WORKSPACE" ]; then T="-workspace $WORKSPACE"; else T="-project $PROJECT"; fi
-          SCHEME=$(xcodebuild $T -list | sed -n '/Schemes:/,$p' | tail -n +2 | head -1 | xargs)
-          echo "使用 scheme: $SCHEME"
-          xcodebuild $T \
-            -scheme "$SCHEME" \
-            -configuration Release \
+          ls -la
+          WORKSPACE=$(ls -d *.xcworkspace 2>/dev/null | head -1 || true)
+          PROJECT=$(ls -d *.xcodeproj 2>/dev/null | head -1 || true)
+          if [ -n "$WORKSPACE" ]; then echo "TARGET_ARG=-workspace $WORKSPACE" >> $GITHUB_ENV; else echo "TARGET_ARG=-project $PROJECT" >> $GITHUB_ENV; fi
+          echo "---- schemes ----"
+          xcodebuild $TARGET_ARG -list
+
+      - name: Build .app（关闭签名）
+        working-directory: app
+        run: |
+          xcodebuild $TARGET_ARG \
+            -scheme MNGA \
+            -configuration Debug \
             -destination 'generic/platform=iOS' \
-            -archivePath build/MNGA.xcarchive \
+            -derivedDataPath ../build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            archive | xcbeautify
+            build
 
-      - name: 手动打包成 .ipa
+      - name: 打包成 .ipa
         run: |
-          APP=$(find build/MNGA.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
+          APP=$(find build/DerivedData/Build/Products -maxdepth 2 -name "*.app" | head -1)
+          if [ -z "$APP" ]; then echo "❌ 没找到 .app 产物"; find build -maxdepth 4 -type d | head -50; exit 1; fi
           echo "找到 app: $APP"
-          mkdir -p Payload
+          rm -rf Payload && mkdir -p Payload
           cp -R "$APP" Payload/
           zip -qry MNGA-unsigned.ipa Payload
           ls -lh MNGA-unsigned.ipa
