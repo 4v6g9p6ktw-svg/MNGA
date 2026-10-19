@@ -1,0 +1,71 @@
+name: Build Unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 切换 Xcode 命令行工具路径
+        run: sudo xcode-select --switch /Applications/Xcode.app
+
+      - name: 打印 Xcode 版本
+        run: xcodebuild -version && swift --version
+
+      - name: 安装 Rust 工具链
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          source "$HOME/.cargo/env"
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: 安装 brew 依赖
+        run: brew install swift-protobuf tuist xcbeautify
+
+      - name: 安装 xcraft
+        run: cargo install xcraft
+
+      - name: 编译 Rust logic 层 + 合成 xcframework
+        run: make ios
+
+      - name: 生成工程并构建
+        run: make build
+
+      - name: Archive（关闭签名）
+        run: |
+          WORKSPACE=$(ls -d app/*.xcworkspace 2>/dev/null | head -1 || true)
+          PROJECT=$(ls -d app/*.xcodeproj 2>/dev/null | head -1 || true)
+          if [ -n "$WORKSPACE" ]; then T="-workspace $WORKSPACE"; else T="-project $PROJECT"; fi
+          SCHEME=$(xcodebuild $T -list | sed -n '/Schemes:/,$p' | tail -n +2 | head -1 | xargs)
+          echo "使用 scheme: $SCHEME"
+          xcodebuild $T \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/MNGA.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            archive | xcbeautify
+
+      - name: 手动打包成 .ipa
+        run: |
+          APP=$(find build/MNGA.xcarchive/Products/Applications -maxdepth 1 -name "*.app" | head -1)
+          echo "找到 app: $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry MNGA-unsigned.ipa Payload
+          ls -lh MNGA-unsigned.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: MNGA-unsigned-ipa
+          path: MNGA-unsigned.ipa
+          retention-days: 14
